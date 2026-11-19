@@ -1,0 +1,187 @@
+name: build sheng iPadOS 27 (full images to Release)
+
+# 目的：用 GitHub 自己的 macOS runner 构建完整镜像并发布，不依赖本地网络。
+# 与上游 macos.yml 的区别：上游只上传日志（"publishes text logs and no images"），
+# 这个 workflow 把 boot/payload/kernel/userdata/seed 全部发布为 Release asset。
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_ref:
+        description: UniXNU-sheng ref (branch/tag/sha)
+        type: string
+        default: main
+      core_ref:
+        description: UniXNU core ref
+        type: string
+        default: main
+      defconfig:
+        description: Defconfig
+        type: string
+        default: sheng_ipados27_defconfig
+      os_profile:
+        description: --os profile
+        type: string
+        default: ipados-27
+      build_userdata:
+        description: Also build userdata root image (~16 GB, needs disk)
+        type: boolean
+        default: true
+      publish_release:
+        description: Publish a Release with the images
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 350
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      UNIXNU_IPSW_JOBS: 16
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      GITHUB_TOKEN: ${{ github.token }}
+      UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      OS_PROFILE: ${{ inputs.os_profile }}
+
+    steps:
+      - name: Check out device sources (upstream)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: ${{ inputs.device_ref }}
+          path: device
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - name: Check out core sources (upstream)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ inputs.core_ref }}
+          path: UniXNU
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - name: Check out firmware sources (upstream)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          ref: main
+          path: uefi-sheng
+          submodules: false
+          token: ${{ github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify inputs
+        run: |
+          set -e
+          echo "device:  $(git -C device  rev-parse HEAD)  $(git -C device  log -1 --format=%s)"
+          echo "core:    $(git -C UniXNU  rev-parse HEAD)  $(git -C UniXNU  log -1 --format=%s)"
+          echo "uefi:    $(git -C uefi-sheng rev-parse HEAD)"
+          ls device/configs/
+          test -f "device/configs/$DEFCONFIG" || { echo "::error::missing configs/$DEFCONFIG"; exit 1; }
+          df -h "$GITHUB_WORKSPACE"
+          xcodebuild -version
+
+      - name: Install host tools
+        run: |
+          brew install llvm lld mtools dtc
+          command -v unifdef || brew install unifdef
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Select device and fetch sources
+        working-directory: UniXNU
+        run: |
+          ./unixnu defconfig "$DEFCONFIG" -D ../device --os "$OS_PROFILE"
+          ./unixnu fetch -D ../device --os "$OS_PROFILE"
+          ./unixnu status --json -D ../device --os "$OS_PROFILE" | head -c 4000
+
+      - name: Build kernel
+        working-directory: UniXNU
+        run: ./unixnu build kernel -D ../device --os "$OS_PROFILE"
+
+      - name: Build package
+        working-directory: UniXNU
+        run: ./unixnu build package -D ../device --os "$OS_PROFILE"
+
+      - name: Build firmware
+        working-directory: UniXNU
+        run: ./unixnu build firmware --uefi ../uefi-sheng -D ../device --os "$OS_PROFILE"
+
+      - name: Build payload
+        working-directory: UniXNU
+        run: |
+          # [payload.runtime] skip_setup 已由 board.toml 控制；这里不传 --skip-setup
+          # （它要求同时给 --data-ramdisk，而 seed 由 runtime 步骤自己生成）
+          ./unixnu build payload -D ../device --os "$OS_PROFILE"
+
+      - name: Build boot image
+        working-directory: UniXNU
+        run: ./unixnu bootimg --uefi ../uefi-sheng -D ../device --os "$OS_PROFILE"
+
+      - name: Build userdata
+        if: inputs.build_userdata
+        working-directory: UniXNU
+        run: |
+          ./unixnu build userdata -D ../device --os "$OS_PROFILE"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Collect artifacts
+        run: |
+          set -e
+          mkdir -p out-artifacts
+          find UniXNU/out -maxdepth 5 -type f \( -name 'boot.img' -o -name 'payload.img' -o -name 'kernel.macho' -o -name 'package.manifest.json' -o -name 'userdata-root.img' -o -name 'userdata-root.json' -o -name 'data.dbr' \) -exec ls -lh {} \;
+          find UniXNU/out -maxdepth 5 -type f -name 'boot.img'          -exec cp {} out-artifacts/ \;
+          find UniXNU/out -maxdepth 5 -type f -name 'payload.img'       -exec cp {} out-artifacts/ \;
+          find UniXNU/out -maxdepth 5 -type f -name 'kernel.macho'      -exec cp {} out-artifacts/ \;
+          find UniXNU/out -maxdepth 5 -type f -name 'package.manifest.json' -exec cp {} out-artifacts/ \;
+          find UniXNU/out -maxdepth 5 -type f -name 'data.dbr'          -exec cp {} out-artifacts/ \;
+          find UniXNU/out -maxdepth 5 -type f -name 'userdata-root.json' -exec cp {} out-artifacts/ \;
+          if [ "${{ inputs.build_userdata }}" = "true" ]; then
+            find UniXNU/out -maxdepth 5 -type f -name 'userdata-root.img' -exec cp {} out-artifacts/ \;
+          fi
+          ls -lh out-artifacts/
+          cd out-artifacts && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheng-ipados27-full
+          path: out-artifacts/
+          compression-level: 0
+          retention-days: 5
+
+      - name: Publish Release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="sheng-ipados27-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" out-artifacts/* \
+            --repo "${{ github.repository }}" \
+            --title "sheng iPadOS 27 full images ($TAG)" \
+            --notes "Built from UniXNU/UniXNU-sheng@$(git -C device rev-parse --short HEAD) and UniXNU/UniXNU@$(git -C UniXNU rev-parse --short HEAD) on $(date -u). Contains boot.img, payload.img, kernel.macho, data.dbr, package.manifest.json, userdata-root.img and SHA256SUMS.txt."
+          echo "released as $TAG"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            UniXNU/out/sheng/*/*/logs/*.log
+          retention-days: 5
+
+      - name: Remove proprietary inputs
+        if: always()
+        run: |
+          rm -rf UniXNU/out/ipsw UniXNU/out/feeds device/.cache/firmware 2>/dev/null || true
