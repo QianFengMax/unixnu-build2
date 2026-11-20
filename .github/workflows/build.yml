@@ -144,6 +144,19 @@ jobs:
           echo "--- patch dir now contains ---"
           ls -1 "$DEST_DIR" | tail -5
 
+      - name: Prepare device sources and firmware
+        # 官方 device 仓的 scripts/package.sh 不准备 Ath12kWifi 的依赖：
+        # prepare-supplicant.py 只做 --check（要求 deps/ 已存在），
+        # 真正下载要靠 fetch-sources.py（无 --check 时才下载）。
+        # freebsd 源需要 sparse-checkout + 按 commit fetch（不是 clone --branch）。
+        working-directory: device
+        run: |
+          set -e
+          python3 scripts/extract-files.py
+          python3 tools-prepare-freedsb.py
+          python3 drivers/Ath12kWifi/tools/fetch-sources.py
+          ls -la drivers/Ath12kWifi/deps/
+
       - name: platform seed
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
