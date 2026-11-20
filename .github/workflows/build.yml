@@ -1,18 +1,36 @@
-name: build sheng iPadOS 27 (verified path, images to Release)
+name: build sheng iPadOS 27 (persistent boot, latest fixes)
 
-# 复刻 s1eke/UniXNU-sheng 的 package.yml——该配置在 2026-11-19 08:25 实测成功产出 images-27。
-# 与上游 macos.yml 的关键区别：走 scripts/package.sh（unixnu release），一次跑完全流程，
-# 避免分步调用时 bootstrap pass 的链接失败；core 固定在已验证的 563595ab。
+# 目标：产出可【刷入 boot 分区、脱离电脑启动】的 UniXNU 镜像，并包含最新修复。
+#
+# 依据官方文档（unixnu.com）：
+#   - Building: scripts/package.sh 是官方打包入口（unixnu release：deps/preflight/patches/build/pack/verify）
+#   - guide/userdata: 首次安装用 --init-data 生成 Data seed
+#   - reference/cli: --kernel-arg 可覆盖板级启动参数
+#
+# 非临时启动的必要条件（本 workflow 逐条落实并校验）：
+#   1. boot.img 必须 ≤ boot_b 分区 192 MiB（201326592 B），payload size_mib=176
+#   2. 命令行不得含 autoreset=（否则会定时重启回 fastboot）
+#   3. 必须含 uefi-watchdog=1 —— 固件 SHENG_BOOT_GUARD 会 arm 30000 ms Gunyah 看门狗，
+#      DXE 在 ExitBootServices 交出后若内核不接管，30 秒即硬件复位（详见 porting.toml）
+#
+# 最新修复：
+#   - device 取上游 main（含 11-18 触控漂移修正等最新提交）
+#   - core 固定 563595ab：其后的 8542980d/519d8024 仅改 devices.toml 与 docs/，无代码差异
+#   - 应用 0065-ios-read-pages-and-mapped-writable.patch：
+#     metal2vulkan 的 read_pages/mapped_writable 只声明在 target_os="macos"，
+#     ios27 上编译报 E0425，必须把 cfg 扩到 ios（否则 GPU bridge 构建失败）
+#
+# 平台种子：secrets.UNIXNU_UNIQUE_CHIP_ID（8 位 hex，请自行保管，不要入库）
 
 on:
   workflow_dispatch:
     inputs:
       device_ref:
-        description: UniXNU-sheng ref (branch/tag/sha)
+        description: UniXNU-sheng ref
         type: string
         default: main
       core_ref:
-        description: UniXNU core ref (563595ab is the verified pin)
+        description: UniXNU core ref (563595ab = verified; later commits are docs-only)
         type: string
         default: 563595abedfdfa413ad583b66b6176d82007e633
       os:
@@ -21,7 +39,11 @@ on:
         options: ["27", "26", "17"]
         default: "27"
       init_data:
-        description: Create a NEW installation seed if no saved seed exists (iPadOS 27)
+        description: Create a NEW Data seed (first installation)
+        type: boolean
+        default: true
+      watchdog:
+        description: Add uefi-watchdog=1 (REQUIRED for persistent boot off the PC)
         type: boolean
         default: true
       publish_release:
@@ -33,19 +55,24 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-persistent-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   package:
     runs-on: macos-26
-    timeout-minutes: 360
+    timeout-minutes: 350
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       HOMEBREW_NO_AUTO_UPDATE: 1
       GITHUB_TOKEN: ${{ github.token }}
 
     steps:
+      - name: Check out this workflow repository
+        uses: actions/checkout@v4
+        with:
+          path: build
+
       - name: Check out device sources
         uses: actions/checkout@v4
         with:
@@ -73,58 +100,56 @@ jobs:
           submodules: recursive
           token: ${{ github.token }}
 
-      - name: Patch UniXNU metal bridge for ios27
-        run: |
-          set -e
-          P="$GITHUB_WORKSPACE/device/.github/patches/0065-ios-read-pages-and-mapped-writable.patch"
-          if [ -f "$P" ]; then
-            cp "$P" "$GITHUB_WORKSPACE/UniXNU/drivers/AdrenoMetal/bridge/patches/"
-            python3 "$GITHUB_WORKSPACE/tools-patch-bridge.py"
-          else
-            echo "no 0065 patch in the device tree; skipping"
-          fi
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-
-      - name: Verify inputs
-        run: |
-          set -e
-          echo "device: $(git -C device   rev-parse HEAD)  $(git -C device   log -1 --format=%s)"
-          echo "core:   $(git -C UniXNU   rev-parse HEAD)  $(git -C UniXNU   log -1 --format=%s)"
-          echo "uefi:   $(git -C uefi-sheng rev-parse HEAD)"
-          test -f device/board.toml || { echo "::error::missing board.toml"; exit 1; }
-          ls device/configs/
-          df -h "$GITHUB_WORKSPACE"
-          xcodebuild -version
 
       - name: Install host tools
         run: |
           brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools \
                        bison pkgconf rustup blacktop/tap/ipsw
-          command -v unifdef || brew install unifdef
+          command -v unifdef >/dev/null || brew install unifdef
           {
             echo "$HOME/.cargo/bin"
             echo "$(brew --prefix llvm)/bin"
             echo "$(brew --prefix bison)/bin"
           } >> "$GITHUB_PATH"
-          rustup toolchain install 1.98.0 --profile minimal --component rust-src || true
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          rustup default 1.98.0
 
       - name: Report the toolchain
         run: |
-          for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput aea \
-                   compression_tool mtools mcopy ipsw rustc cargo; do
+          set -e
+          echo "device: $(git -C device    rev-parse HEAD)  $(git -C device    log -1 --format=%s)"
+          echo "core:   $(git -C UniXNU    rev-parse HEAD)  $(git -C UniXNU    log -1 --format=%s)"
+          echo "uefi:   $(git -C uefi-sheng rev-parse HEAD)"
+          test -f device/board.toml || { echo "::error::missing board.toml"; exit 1; }
+          ls device/configs/
+          for t in clang xcodebuild make ninja cmake dtc fdtget fdtput mtools mcopy \
+                   ipsw rustc cargo compression_tool aea; do
             printf '%-20s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
           done
-          xcrun --sdk iphoneos --show-sdk-version
+          xcodebuild -version
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Apply the ios27 metal2vulkan patch
+        run: |
+          set -e
+          SRC="build/patches/0065-ios-read-pages-and-mapped-writable.patch"
+          test -f "$SRC" || { echo "::error::missing $SRC"; exit 1; }
+          DEST_DIR="UniXNU/drivers/AdrenoMetal/bridge/patches"
+          test -d "$DEST_DIR" || { echo "::error::missing $DEST_DIR"; exit 1; }
+          cp "$SRC" "$DEST_DIR/"
+          python3 build/tools-patch-bridge.py
+          echo "--- patch dir now contains ---"
+          ls -1 "$DEST_DIR" | tail -5
 
       - name: platform seed
         env:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
         run: |
           test -n "$UNIXNU_UNIQUE_CHIP_ID" || { echo "::error::set the UNIXNU_UNIQUE_CHIP_ID secret"; exit 1; }
-          echo "seed is set (${#UNIXNU_UNIQUE_CHIP_ID} chars)"
+          echo "seed length ${#UNIXNU_UNIQUE_CHIP_ID}"
 
       - name: package
         working-directory: device
@@ -132,53 +157,92 @@ jobs:
           UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
           GITHUB_TOKEN: ${{ github.token }}
           INIT_DATA: ${{ inputs.init_data }}
+          WATCHDOG: ${{ inputs.watchdog }}
           OS_PROFILE: ${{ inputs.os }}
         run: |
           set -e
           args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
+
           if [ "$OS_PROFILE" = 27 ] && [ "$INIT_DATA" = true ]; then
             args+=(--init-data)
           fi
-          echo "running: scripts/package.sh ${args[*]}"
+
+          # 非临时启动：接管固件已 arm 的 30 s Gunyah 看门狗
+          if [ "$WATCHDOG" = true ]; then
+            args+=(--kernel-arg uefi-watchdog=1)
+          fi
+
+          echo "package.sh ${args[*]}"
           scripts/package.sh "${args[@]}"
 
-      - name: inventory outputs
+      - name: Verify the image is fit for persistent boot
         if: always()
         run: |
-          echo "=== outputs ==="
-          find UniXNU/out -maxdepth 6 -type f \
-            \( -name 'boot.img' -o -name 'payload.img' -o -name 'kernel.macho' \
-               -o -name 'package.manifest.json' -o -name 'userdata-root.img' \
-               -o -name 'userdata-root.json' -o -name 'data.dbr' \) \
-            -exec ls -lh {} \; || true
+          set -e
+          BOOT=$(find UniXNU/out -maxdepth 6 -type f -name boot.img | head -1)
+          MAN=$(find UniXNU/out -maxdepth 6 -type f -name package.manifest.json | head -1)
+          echo "boot.img : ${BOOT:-MISSING}"
+          echo "manifest : ${MAN:-MISSING}"
+          [ -n "$BOOT" ] || { echo "::error::no boot.img produced"; exit 1; }
 
-      - name: collect
+          SIZE=$(stat -f %z "$BOOT")
+          LIMIT=201326592            # boot_b = 192 MiB
+          echo "boot.img size = $SIZE bytes"
+          echo "boot_b limit  = $LIMIT bytes"
+          if [ "$SIZE" -le "$LIMIT" ]; then
+            echo "SIZE OK: fits boot_b with $((LIMIT - SIZE)) bytes spare"
+          else
+            echo "::error::boot.img is $SIZE bytes, exceeds boot_b ($LIMIT)"
+            exit 1
+          fi
+
+          if [ -n "$MAN" ]; then
+            python3 - "$MAN" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          cmd = m.get("kernel_command_line", "")
+          print(f"cmdline bytes = {m.get('kernel_command_line_bytes', len(cmd))}")
+          print(f"has uefi-watchdog=1 : {'uefi-watchdog=1' in cmd}")
+          print(f"has autoreset=      : {'autoreset=' in cmd}")
+          ok = True
+          if "uefi-watchdog=1" not in cmd:
+              print("::error::missing uefi-watchdog=1 - the 30 s firmware watchdog is not taken over, "
+                    "the image cannot stay up off the PC")
+              ok = False
+          if "autoreset=" in cmd:
+              print("::error::autoreset present - the image would reboot to fastboot on a timer")
+              ok = False
+          sys.exit(0 if ok else 1)
+          PY
+          fi
+
+      - name: Collect outputs
         if: always()
         run: |
           mkdir -p out-artifacts
-          for n in boot.img payload.img kernel.macho package.manifest.json userdata-root.img userdata-root.json data.dbr; do
+          for n in boot.img payload.img kernel.macho package.manifest.json \
+                   userdata-root.img userdata-root.json data.dbr; do
             find UniXNU/out -maxdepth 6 -type f -name "$n" -exec cp -v {} out-artifacts/ \; || true
           done
           ls -lh out-artifacts/ || true
-          cd out-artifacts && shasum -a 256 * > SHA256SUMS.txt 2>/dev/null && cat SHA256SUMS.txt || true
+          ( cd out-artifacts && shasum -a 256 * > SHA256SUMS.txt 2>/dev/null && cat SHA256SUMS.txt ) || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sheng-ipados${{ inputs.os }}-images
+          name: sheng-ipados${{ inputs.os }}-persistent
           path: out-artifacts/
           compression-level: 0
-          retention-days: 5
+          retention-days: 7
 
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: |
-            UniXNU/out/sheng/*/*/logs/*.log
-          retention-days: 5
+          path: UniXNU/out/sheng/*/*/logs/*.log
+          retention-days: 7
 
       - name: Publish Release
         if: inputs.publish_release && success()
@@ -188,11 +252,13 @@ jobs:
           set -e
           cd out-artifacts
           ls -1
-          TAG="sheng-ipados${{ inputs.os }}-$(date +%Y%m%d-%H%M%S)"
+          TAG="sheng-ipados${{ inputs.os }}.0.1-persistent-$(date +%Y%m%d-%H%M%S)"
           gh release create "$TAG" * \
             --repo "${{ github.repository }}" \
-            --title "sheng iPadOS ${{ inputs.os }} images ($TAG)" \
-            --notes "device UniXNU-sheng@$(git -C ../device rev-parse --short HEAD), core UniXNU@$(git -C ../UniXNU rev-parse --short HEAD). Built on $(date -u)."
+            --title "sheng iPadOS ${{ inputs.os }} persistent-boot images ($TAG)" \
+            --notes "device UniXNU-sheng@$(git -C ../device rev-parse --short HEAD), core UniXNU@$(git -C ../UniXNU rev-parse --short HEAD).
+          Contains uefi-watchdog=1 for persistent boot; boot.img fits a 192 MiB boot_b.
+          Flash: fastboot flash userdata userdata-root.img; fastboot flash boot_b boot.img; fastboot set_active b"
           echo "released $TAG"
 
       - name: Remove proprietary inputs
