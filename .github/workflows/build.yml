@@ -153,7 +153,8 @@ jobs:
         run: |
           set -e
           python3 scripts/extract-files.py
-          python3 tools-prepare-freedsb.py
+          # 辅助脚本在 workflow 仓库的 build/ 下，device 是另一个目录
+          python3 "$GITHUB_WORKSPACE/build/tools-prepare-freedsb.py" .
           python3 drivers/Ath12kWifi/tools/fetch-sources.py
           ls -la drivers/Ath12kWifi/deps/
 
