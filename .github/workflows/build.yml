@@ -14,7 +14,11 @@ name: build sheng iPadOS 27 (persistent boot, latest fixes)
 #      DXE 在 ExitBootServices 交出后若内核不接管，30 秒即硬件复位（详见 porting.toml）
 #
 # 最新修复：
-#   - device 取上游 main（含 11-18 触控漂移修正等最新提交）
+#   - device 用 PR #138 的 head commit be604455：
+#       它是 main(c8f92b20, 11-18) 的超集（compare API：main 相对它 0 提交 0 文件差异），
+#       额外 10 个提交 14 个文件，含 issue #138 的 sheng-startup-failure-log.patch 修复
+#       （该 PR 至今未合入 main，若用 main 会在 bsd/kern/kern_exec.c:10118 处 patch does not apply）、
+#       CONFIG_XNU_OPTIMIZE_FOR_SIZE、QcomGeniSpi、build-ath12k-wifi.py 等。
 #   - core 固定 563595ab：其后的 8542980d/519d8024 仅改 devices.toml 与 docs/，无代码差异
 #   - 应用 0065-ios-read-pages-and-mapped-writable.patch：
 #     metal2vulkan 的 read_pages/mapped_writable 只声明在 target_os="macos"，
@@ -28,7 +32,7 @@ on:
       device_ref:
         description: UniXNU-sheng ref
         type: string
-        default: main
+        default: be604455450eb70d5fcbf98e7406f7205593a524
       core_ref:
         description: UniXNU core ref (563595ab = verified; later commits are docs-only)
         type: string
