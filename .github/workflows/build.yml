@@ -152,13 +152,16 @@ jobs:
           ls -1 "$DEST_DIR" | tail -5
 
       - name: Fix the startup-failure-log patch context (upstream issue #138)
-        # 上游 PR #138 至今未合入 main；只取它那一个 hunk 修复，
-        # 不引入同一 PR 里的 CONFIG_XNU_OPTIMIZE_FOR_SIZE（那会让 bootstrap pass 链接失败）。
+        # 上游 PR #138 至今未合入 main；只取它那两个独立修复，不引入同一 PR 里的
+        # CONFIG_XNU_OPTIMIZE_FOR_SIZE（那会让归档 bootstrap pass 链接失败）。
         run: |
           set -e
           python3 "$GITHUB_WORKSPACE/build/tools-fix-138.py" "$GITHUB_WORKSPACE/device"
           echo "--- resulting hunk heads ---"
           grep -n '^@@' device/patches/xnu-12377/sheng-startup-failure-log.patch
+          python3 "$GITHUB_WORKSPACE/build/tools-fix-genispi.py" "$GITHUB_WORKSPACE/device"
+          echo "--- iPadOS 27 component list ---"
+          grep -n '"ShengUfs", "QcomGeniSpi", "RamBlock"' device/board.toml
 
       - name: Prepare device sources and firmware
         # 官方 device 仓的 scripts/package.sh 不准备 Ath12kWifi 的依赖：

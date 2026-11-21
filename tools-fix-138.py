@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Apply upstream issue #138's fix to sheng-startup-failure-log.patch in place.
 
 The patch anchors on a "#else ... #endif" pair that only exists in the macOS
@@ -24,7 +24,7 @@ if not patch.is_file():
     print(f'{patch} not found; nothing to do')
     sys.exit(0)
 
-text = patch.read_text()
+text = patch.read_text(encoding='utf-8')
 marker = '+@@ -10119,4 +10119,6 @@'
 
 if marker in text:
@@ -35,8 +35,7 @@ if '@@ -10118,6 +10118,8 @@' not in text:
     print('unexpected startup-failure-log patch shape; leaving it unchanged')
     sys.exit(0)
 
-# 去掉 macOS-only 的 #else / #endif 上下文，重锚到共享调用
-fixed = text.replace(
+# 鍘绘帀 macOS-only 鐨?#else / #endif 涓婁笅鏂囷紝閲嶉敋鍒板叡浜皟鐢?fixed = text.replace(
     '@@ -10118,6 +10118,8 @@\n #else\n \tint data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);\n #endif\n',
     '@@ -10119,4 +10119,6 @@\n \tint data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);\n',
 )
@@ -45,5 +44,5 @@ if fixed == text:
     print('context lines did not match the expected layout; leaving it unchanged')
     sys.exit(0)
 
-patch.write_text(fixed)
+patch.write_text(fixed, encoding='utf-8')
 print(f'applied issue #138 context fix to {patch.relative_to(root)}')

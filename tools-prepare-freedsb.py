@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Stage the freebsd source for Ath12kWifi.
 
 fetch-sources.py clones linux/supplicant but expects the freebsd checkout to
@@ -17,7 +17,7 @@ import sys
 
 device = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else '.').resolve()
 root = device / 'drivers' / 'Ath12kWifi'
-lock = json.loads((root / 'tools' / 'source-lock.json').read_text())
+lock = json.loads((root / 'tools' / 'source-lock.json').read_text(encoding='utf-8'))
 src = lock['freebsd']
 dst = root / 'deps' / 'freebsd'
 
